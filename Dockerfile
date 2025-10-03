@@ -36,20 +36,12 @@ ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=false
 # Copiar package.json y package-lock.json (si existe)
 COPY package*.json ./
 
-# Instalar dependencias de Node.js
-RUN npm install --only=production
-
 # Copiar el resto del código
 COPY . .
 
-# Crear usuario no-root para seguridad
-RUN groupadd -r nodejs && useradd -r -g nodejs -G audio,video nodejs \
-    && mkdir -p /home/nodejs/Downloads \
-    && chown -R nodejs:nodejs /home/nodejs
-
-# Cambiar propiedad de los archivos al usuario no-root
-RUN chown -R nodejs:nodejs /app
-USER nodejs
+# Configurar npm para SSL y instalar dependencias
+RUN npm config set strict-ssl false
+RUN npm install
 
 # Exponer el puerto
 EXPOSE 3000

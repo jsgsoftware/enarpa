@@ -1,7 +1,7 @@
-import express from 'express';
-import cors from 'cors';
-import puppeteer from 'puppeteer';
-import dotenv from 'dotenv';
+const express = require('express');
+const cors = require('cors');
+const puppeteer = require('puppeteer');
+const dotenv = require('dotenv');
 
 dotenv.config();
 
@@ -67,6 +67,7 @@ app.post('/api/consulta', authenticate, async (req, res) => {
 
   const browser = await puppeteer.launch({
     headless: true,
+    ignoreHTTPSErrors: true, // Ignorar errores de certificado en Chromium
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
@@ -75,7 +76,8 @@ app.post('/api/consulta', authenticate, async (req, res) => {
       '--no-first-run',
       '--no-zygote',
       '--single-process',
-      '--disable-gpu'
+      '--disable-gpu',
+      '--ignore-certificate-errors' // Ignorar errores de certificado a nivel de Chrome
     ]
   });
 
