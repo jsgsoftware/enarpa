@@ -1,0 +1,73 @@
+{
+  "meta": {
+    "instanceId": "1234567890abcdef"
+  },
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "start-trigger",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Configurar las 40 placas a procesar\nconst placas = [\n  \"EI2430\", \"EI2431\", \"EI2432\", \"EI2433\", \"EI2438\", \"EI2439\",\n  \"EK5464\", \"EK5465\", \"EK5466\", \"EK5467\", \"EK5468\", \"EK5469\",\n  \"EL3928\", \"EL3929\", \"EL3930\", \"EL3931\", \"EL3932\", \"EL3933\",\n  \"EL3934\", \"EL3957\", \"EL3958\", \"EL3959\", \"EM3064\", \"EM3065\",\n  \"EM3066\", \"EM3067\", \"EM3068\", \"EM3069\", \"EM3070\", \"EM3071\",\n  \"EM3072\", \"EM3073\", \"EM3074\", \"EM3075\", \"EM3076\", \"EM3078\",\n  \"EM3079\", \"EM3080\", \"EM3081\", \"EM3082\"\n];\n\n// Dividir en lotes de 5 placas para evitar timeouts\nconst tamañoLote = 5;\nconst lotes = [];\n\nfor (let i = 0; i < placas.length; i += tamañoLote) {\n  lotes.push({\n    loteNumero: Math.floor(i / tamañoLote) + 1,\n    totalLotes: Math.ceil(placas.length / tamañoLote),\n    placas: placas.slice(i, i + tamañoLote),\n    inicio: i + 1,\n    fin: Math.min(i + tamañoLote, placas.length)\n  });\n}\n\nconsole.log(`📦 Creados ${lotes.length} lotes de máximo ${tamañoLote} placas`);\n\nreturn lotes.map(lote => ({ json: lote }));"
+      },
+      "id": "create-batches",
+      "name": "Crear Lotes de Placas",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {
+          "reset": false
+        }
+      },
+      "id": "split-batches",
+      "name": "Procesar Un Lote a la Vez",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "url": "https://applabs-ena.oqsrcv.easypanel.host/api/consulta-placa-sync",
+        "authentication": "none",
+        "requestFormat": "json",
+        "jsonParameters": true,
+        "parametersJson": "={\n  \"placas\": {{ JSON.stringify($json.placas) }}\n}",
+        "options": {
+          "timeout": 60000,
+          "redirect": {
+            "followRedirects": true,
+            "maxRedirects": 5
+          },
+          "response": {
+            "fullResponse": false,
+            "neverError": false,
+            "responseFormat": "autodetect"
+          }
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-client-id",
+              "value": "mi_cliente_super_seguro"
+            },
+            {
+              "name": "x-client-secret",
+              "value": "mi_secreto_super_seguro"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        }\n      },\n      \"id\": \"http-request\",\n      \"name\": \"Consultar Lote de Placas\",\n      \"type\": \"n8n-nodes-base.httpRequest\",\n      \"typeVersion\": 4,\n      \"position\": [900, 300]\n    },\n    {\n      \"parameters\": {\n        \"functionCode\": \"// Procesar respuesta del lote\\nconst loteInfo = $('Procesar Un Lote a la Vez').item.json;\\nconst respuesta = $json;\\n\\n// Agregar información del lote a cada resultado\\nconst resultado = {\\n  lote: loteInfo.loteNumero,\\n  totalLotes: loteInfo.totalLotes,\\n  placasEnLote: loteInfo.placas,\\n  consultados: respuesta.consultados || [],\\n  errores: respuesta.errores || [],\\n  timestamp: new Date().toISOString()\\n};\\n\\n// Log de progreso\\nconsole.log(`✅ Lote ${loteInfo.loteNumero}/${loteInfo.totalLotes} completado:`);\\nconsole.log(`   📊 Exitosas: ${resultado.consultados.length}`);\\nconsole.log(`   ❌ Errores: ${resultado.errores.length}`);\\n\\nreturn { json: resultado };\"\n      },\n      \"id\": \"process-response\",\n      \"name\": \"Procesar Respuesta del Lote\",\n      \"type\": \"n8n-nodes-base.function\",\n      \"typeVersion\": 1,\n      \"position\": [1120, 300]\n    },\n    {\n      \"parameters\": {\n        \"amount\": 3,\n        \"unit\": \"seconds\"\n      },\n      \"id\": \"wait-between-batches\",\n      \"name\": \"Pausa Entre Lotes\",\n      \"type\": \"n8n-nodes-base.wait\",\n      \"typeVersion\": 1,\n      \"position\": [1340, 300]\n    },\n    {\n      \"parameters\": {\n        \"functionCode\": \"// Compilar todos los resultados de todos los lotes\\nconst todosLosLotes = $input.all();\\n\\nconst resultadoFinal = {\\n  resumen: {\\n    timestamp: new Date().toISOString(),\\n    totalLotes: 0,\\n    totalPlacasProcesadas: 0,\\n    totalExitosas: 0,\\n    totalErrores: 0,\\n    porcentajeExito: 0\\n  },\\n  consultados: [],\\n  errores: [],\\n  detallesPorLote: []\\n};\\n\\n// Procesar cada lote\\nfor (const lote of todosLosLotes) {\\n  const data = lote.json;\\n  \\n  // Agregar consultados\\n  if (data.consultados && Array.isArray(data.consultados)) {\\n    resultadoFinal.consultados.push(...data.consultados);\\n  }\\n  \\n  // Agregar errores\\n  if (data.errores && Array.isArray(data.errores)) {\\n    resultadoFinal.errores.push(...data.errores);\\n  }\\n  \\n  // Guardar detalles del lote\\n  resultadoFinal.detallesPorLote.push({\\n    lote: data.lote,\\n    placas: data.placasEnLote,\\n    exitosas: data.consultados?.length || 0,\\n    errores: data.errores?.length || 0,\\n    timestamp: data.timestamp\\n  });\\n}\\n\\n// Calcular resumen\\nresultadoFinal.resumen.totalLotes = resultadoFinal.detallesPorLote.length;\\nresultadoFinal.resumen.totalExitosas = resultadoFinal.consultados.length;\\nresultadoFinal.resumen.totalErrores = resultadoFinal.errores.length;\\nresultadoFinal.resumen.totalPlacasProcesadas = \\n  resultadoFinal.resumen.totalExitosas + resultadoFinal.resumen.totalErrores;\\nresultadoFinal.resumen.porcentajeExito = \\n  resultadoFinal.resumen.totalPlacasProcesadas > 0 \\n    ? Math.round((resultadoFinal.resumen.totalExitosas / resultadoFinal.resumen.totalPlacasProcesadas) * 100)\\n    : 0;\\n\\n// Log final\\nconsole.log('🎉 PROCESAMIENTO COMPLETADO:');\\nconsole.log(`📊 Total procesadas: ${resultadoFinal.resumen.totalPlacasProcesadas}`);\\nconsole.log(`✅ Exitosas: ${resultadoFinal.resumen.totalExitosas}`);\\nconsole.log(`❌ Errores: ${resultadoFinal.resumen.totalErrores}`);\\nconsole.log(`📈 Porcentaje de éxito: ${resultadoFinal.resumen.porcentajeExito}%`);\\n\\nreturn { json: resultadoFinal };\"\n      },\n      \"id\": \"compile-results\",\n      \"name\": \"Compilar Resultados Finales\",\n      \"type\": \"n8n-nodes-base.function\",\n      \"typeVersion\": 1,\n      \"position\": [1560, 300]\n    }\n  ],\n  \"connections\": {\n    \"Manual Trigger\": {\n      \"main\": [\n        [\n          {\n            \"node\": \"Crear Lotes de Placas\",\n            \"type\": \"main\",\n            \"index\": 0\n          }\n        ]\n      ]\n    },\n    \"Crear Lotes de Placas\": {\n      \"main\": [\n        [\n          {\n            \"node\": \"Procesar Un Lote a la Vez\",\n            \"type\": \"main\",\n            \"index\": 0\n          }\n        ]\n      ]\n    },\n    \"Procesar Un Lote a la Vez\": {\n      \"main\": [\n        [\n          {\n            \"node\": \"Consultar Lote de Placas\",\n            \"type\": \"main\",\n            \"index\": 0\n          }\n        ]\n      ]\n    },\n    \"Consultar Lote de Placas\": {\n      \"main\": [\n        [\n          {\n            \"node\": \"Procesar Respuesta del Lote\",\n            \"type\": \"main\",\n            \"index\": 0\n          }\n        ]\n      ]\n    },\n    \"Procesar Respuesta del Lote\": {\n      \"main\": [\n        [\n          {\n            \"node\": \"Pausa Entre Lotes\",\n            \"type\": \"main\",\n            \"index\": 0\n          }\n        ]\n      ]\n    },\n    \"Pausa Entre Lotes\": {\n      \"main\": [\n        [\n          {\n            \"node\": \"Compilar Resultados Finales\",\n            \"type\": \"main\",\n            \"index\": 0\n          }\n        ]\n      ]\n    }\n  },\n  \"pinData\": {},\n  \"versionId\": \"12345678-1234-1234-1234-123456789abc\"\n}
