@@ -25,6 +25,28 @@ if (process.env.NODE_ENV !== 'production') {
   process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 }
 
+// Inicializar conexión a base de datos
+async function initDatabase() {
+  try {
+    const { testConnection } = require('./src/config/database');
+    const conexionExitosa = await testConnection();
+    
+    if (conexionExitosa) {
+      console.log('✅ Base de datos PostgreSQL conectada correctamente');
+      
+      // Obtener estadísticas iniciales
+      const consultaPlacaDB = require('./src/services/consultaPlacaDB');
+      const stats = await consultaPlacaDB.obtenerEstadisticas();
+      console.log(`📊 Estadísticas DB: ${stats.total_consultas} consultas totales, ${stats.placas_unicas} placas únicas`);
+    } else {
+      console.log('⚠️ No se pudo conectar a PostgreSQL - continuando sin persistencia');
+    }
+  } catch (error) {
+    console.error('❌ Error inicializando base de datos:', error.message);
+    console.log('⚠️ Continuando sin persistencia en base de datos');
+  }
+}
+
 // Middleware para logging de requests largos
 app.use((req, res, next) => {
   const start = Date.now();
@@ -84,10 +106,14 @@ app.use((error, req, res, next) => {
 
 // Inicio del servidor
 const PORT = process.env.PORT || 3000;
-const server = app.listen(PORT, () => {
+const server = app.listen(PORT, async () => {
   console.log(`🚀 API corriendo en http://localhost:${PORT}`);
   console.log(`📊 Stats disponibles en http://localhost:${PORT}/stats`);
   console.log(`💚 Health check en http://localhost:${PORT}/health`);
+  console.log(`🗄️ Test DB en http://localhost:${PORT}/api/test-db`);
+  
+  // Inicializar base de datos después de que el servidor esté listo
+  await initDatabase();
 });
 
 // Configurar timeouts del servidor
