@@ -8,17 +8,19 @@
  * @returns {Date} Fecha ajustada a la zona horaria de Panamá
  */
 function obtenerFechaPanama() {
-  const ahora = new Date();
+  // Crear fecha actual UTC
+  const utc = new Date();
   
-  // Panamá está en UTC-5
-  const offsetPanama = -5 * 60; // -5 horas en minutos
-  const offsetLocal = ahora.getTimezoneOffset(); // offset del servidor en minutos
+  // Panamá está en UTC-5, así que restamos 5 horas
+  const panamaTime = new Date(utc.getUTCFullYear(), 
+                              utc.getUTCMonth(), 
+                              utc.getUTCDate(), 
+                              utc.getUTCHours() - 5, 
+                              utc.getUTCMinutes(), 
+                              utc.getUTCSeconds(), 
+                              utc.getUTCMilliseconds());
   
-  // Calcular la diferencia y ajustar
-  const diferenciaMinutos = offsetLocal - offsetPanama;
-  const fechaPanama = new Date(ahora.getTime() + (diferenciaMinutos * 60 * 1000));
-  
-  return fechaPanama;
+  return panamaTime;
 }
 
 /**
@@ -46,14 +48,16 @@ function obtenerFechaPanamaISO() {
  * @returns {Date} Fecha ajustada a la zona horaria de Panamá
  */
 function convertirAZonaPanama(fecha) {
-  const offsetPanama = -5 * 60; // -5 horas en minutos
-  const offsetLocal = fecha.getTimezoneOffset(); // offset del servidor en minutos
+  // Panamá está en UTC-5, así que restamos 5 horas del UTC
+  const panamaTime = new Date(fecha.getUTCFullYear(), 
+                              fecha.getUTCMonth(), 
+                              fecha.getUTCDate(), 
+                              fecha.getUTCHours() - 5, 
+                              fecha.getUTCMinutes(), 
+                              fecha.getUTCSeconds(), 
+                              fecha.getUTCMilliseconds());
   
-  // Calcular la diferencia y ajustar
-  const diferenciaMinutos = offsetLocal - offsetPanama;
-  const fechaPanama = new Date(fecha.getTime() + (diferenciaMinutos * 60 * 1000));
-  
-  return fechaPanama;
+  return panamaTime;
 }
 
 /**

@@ -1,4 +1,5 @@
 const { query, getClient } = require('../config/database');
+const { obtenerFechaPanama, obtenerHoraPanamaFormato } = require('../utils/timezone');
 
 /**
  * Servicio para manejar la persistencia de consultas de placas en PostgreSQL
@@ -52,8 +53,8 @@ class ConsultaPlacaService {
         type_account: resultadoConsulta.typeAccount,
         saldo: resultadoConsulta.saldo || 0,
         adeudado: resultadoConsulta.adeudado || 0,
-        fecha_consulta: fechaLote || new Date(), // Usar fecha del lote si se proporciona
-        hora_ejecucion: horaEjecucion || fechaLote || new Date() // Hora exacta de ejecución del batch
+        fecha_consulta: fechaLote || obtenerFechaPanama(), // Usar fecha del lote o fecha de Panamá
+        hora_ejecucion: horaEjecucion || obtenerHoraPanamaFormato() // Hora exacta de ejecución del batch (formato HH:MM en zona Panamá)
       };
 
       // Insertar en tabla consultas_placas (incluyendo hora_ejecucion)
