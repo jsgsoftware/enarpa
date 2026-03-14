@@ -1,5 +1,34 @@
 const consultaPlacaDB = require('./consultaPlacaDB');
 
+const PLACA_DEBUG_PREFIX = 'PLACA_HTTP_DEBUG|';
+
+function logDetalleErrorPlaca(plate, error) {
+  const msg = error && error.message ? error.message : String(error);
+
+  if (!msg.includes(PLACA_DEBUG_PREFIX)) {
+    return;
+  }
+
+  const payload = msg.split(PLACA_DEBUG_PREFIX)[1];
+  if (!payload) {
+    return;
+  }
+
+  try {
+    const debug = JSON.parse(payload);
+    console.error('🧪 Debug consulta placa (respuesta no JSON):', {
+      plate,
+      endpoint: debug.endpoint,
+      status: debug.status,
+      contentType: debug.contentType,
+      bodyPreview: debug.bodyPreview,
+      timestamp: new Date().toISOString()
+    });
+  } catch (parseError) {
+    console.error('🧪 Debug consulta placa (raw):', payload);
+  }
+}
+
 // Variable para controlar si la DB está disponible
 let dbDisponible = false;
 
@@ -24,13 +53,13 @@ async function consultarPorPlaca(page, plate, fechaLote = null, horaEjecucion = 
     const resultado = await page.evaluate(async (placa) => {
       const token = await new Promise((resolve, reject) => {
         grecaptcha.ready(() => {
-          grecaptcha.execute()
+          grecaptcha.execute('6LcgI9wqAAAAAEPWc0dOvIwJakaL7crE9LH9951j', { action: 'consulta' })
             .then(resolve)
             .catch(reject);
         });
       });
 
-      const resp = await fetch('/api/v2/test/get-morosidad-tag/json', {
+      const resp = await fetch('/apiv2/index.php/get-morosidad-tag/json', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
@@ -42,7 +71,28 @@ async function consultarPorPlaca(page, plate, fechaLote = null, horaEjecucion = 
         })
       });
 
-      const data = await resp.json();
+      const contentType = resp.headers.get('content-type') || '';
+      const rawBody = await resp.text();
+
+      let data;
+      try {
+        data = JSON.parse(rawBody);
+      } catch (parseError) {
+        const bodyPreview = rawBody.slice(0, 1000).replace(/\s+/g, ' ').trim();
+        const debugPayload = {
+          endpoint: resp.url,
+          status: resp.status,
+          contentType: contentType || 'desconocido',
+          bodyPreview
+        };
+        throw new Error(`${PLACA_DEBUG_PREFIX}${JSON.stringify(debugPayload)}`);
+      }
+
+      if (!resp.ok) {
+        const detalle = data && (data.message || data.error) ? (data.message || data.error) : 'sin detalle';
+        throw new Error(`Error HTTP ${resp.status} consultando placa: ${detalle}`);
+      }
+
       return { plate: placa, ...data };
     }, plate);
 
@@ -80,6 +130,7 @@ async function consultarPorPlaca(page, plate, fechaLote = null, horaEjecucion = 
     return resultado;
     
   } catch (error) {
+    logDetalleErrorPlaca(plate, error);
     console.error(`❌ Error consultando placa ${plate}:`, error.message);
     
     // Intentar guardar el error también solo si DB está disponible
@@ -115,13 +166,13 @@ async function consultarPorPlacaSoloConsulta(page, plate) {
     const resultado = await page.evaluate(async (placa) => {
       const token = await new Promise((resolve, reject) => {
         grecaptcha.ready(() => {
-          grecaptcha.execute()
+          grecaptcha.execute('6LcgI9wqAAAAAEPWc0dOvIwJakaL7crE9LH9951j', { action: 'consulta' })
             .then(resolve)
             .catch(reject);
         });
       });
 
-      const resp = await fetch('/api/v2/test/get-morosidad-tag/json', {
+      const resp = await fetch('/apiv2/index.php/get-morosidad-tag/json', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
@@ -133,7 +184,28 @@ async function consultarPorPlacaSoloConsulta(page, plate) {
         })
       });
 
-      const data = await resp.json();
+      const contentType = resp.headers.get('content-type') || '';
+      const rawBody = await resp.text();
+
+      let data;
+      try {
+        data = JSON.parse(rawBody);
+      } catch (parseError) {
+        const bodyPreview = rawBody.slice(0, 1000).replace(/\s+/g, ' ').trim();
+        const debugPayload = {
+          endpoint: resp.url,
+          status: resp.status,
+          contentType: contentType || 'desconocido',
+          bodyPreview
+        };
+        throw new Error(`${PLACA_DEBUG_PREFIX}${JSON.stringify(debugPayload)}`);
+      }
+
+      if (!resp.ok) {
+        const detalle = data && (data.message || data.error) ? (data.message || data.error) : 'sin detalle';
+        throw new Error(`Error HTTP ${resp.status} consultando placa: ${detalle}`);
+      }
+
       return { plate: placa, ...data };
     }, plate);
 
@@ -141,6 +213,7 @@ async function consultarPorPlacaSoloConsulta(page, plate) {
     return resultado;
     
   } catch (error) {
+    logDetalleErrorPlaca(plate, error);
     console.error(`❌ Error consultando placa ${plate}:`, error.message);
     throw error;
   }
