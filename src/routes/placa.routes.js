@@ -1,11 +1,64 @@
 const express = require('express');
 const authenticate = require('../middleware/auth');
-const { launchBrowser, preparePage, randomDelay } = require('../services/browser');
+const { launchBrowser, preparePage, randomDelay, logCurrentPublicIP } = require('../services/browser');
 const { consultarPorPlaca, consultarPorPlacaSoloConsulta } = require('../services/placa');
 const consultaPlacaDB = require('../services/consultaPlacaDB');
 const { obtenerFechaPanama, obtenerHoraPanamaFormato, obtenerFechaPanamaISO } = require('../utils/timezone');
 
 const router = express.Router();
+const PLACA_TARGET_URL = process.env.PLACA_TARGET_URL || 'https://ena.com.pa/consulta-de-placa/';
+
+function normalizarMonto(valor) {
+  if (valor === null || valor === undefined || valor === '') {
+    return 0;
+  }
+
+  const numero = Number(valor);
+  if (!Number.isFinite(numero)) {
+    return 0;
+  }
+
+  return numero >= 100 ? numero / 100 : numero;
+}
+
+function extraerMontoDesdeTexto(texto) {
+  if (!texto || typeof texto !== 'string') {
+    return null;
+  }
+
+  const match = texto.match(/B\/\.?\s*([0-9]+(?:[.,][0-9]{1,2})?)/i);
+  if (!match || !match[1]) {
+    return null;
+  }
+
+  const numero = Number(match[1].replace(',', '.'));
+  return Number.isFinite(numero) ? numero : null;
+}
+
+function obtenerSaldoResultado(resultado) {
+  if (resultado && resultado.balanceAmount !== null && resultado.balanceAmount !== undefined && resultado.balanceAmount !== '') {
+    return normalizarMonto(resultado.balanceAmount);
+  }
+
+  const montoDesdeMensaje = extraerMontoDesdeTexto(resultado && resultado.message);
+  return montoDesdeMensaje !== null ? montoDesdeMensaje : 0;
+}
+
+function obtenerAdeudadoResultado(resultado) {
+  if (resultado && resultado.totalAmount !== null && resultado.totalAmount !== undefined && resultado.totalAmount !== '') {
+    return normalizarMonto(resultado.totalAmount);
+  }
+
+  return 0;
+}
+
+function shouldRotateBrowserPerPlate() {
+  return process.env.ROTATE_BROWSER_PER_PLATE === 'true';
+}
+
+function shouldLogPublicIPEachQuery() {
+  return process.env.LOG_PUBLIC_IP_EACH_QUERY === 'true';
+}
 
 // Función para procesar placas en lotes
 async function procesarLotesDePlacas(placas, batchSize = 10) {
@@ -49,6 +102,8 @@ router.post('/consulta-placa', authenticate, async (req, res) => {
 async function procesarConsultaMasiva(listaPlacas, requestId) {
   let browser = null;
   let page = null;
+  const rotatePerPlate = shouldRotateBrowserPerPlate();
+  const logIP = shouldLogPublicIPEachQuery();
   const resultados = { 
     requestId,
     consultados: [], 
@@ -82,19 +137,37 @@ async function procesarConsultaMasiva(listaPlacas, requestId) {
       
       try {
         // Reiniciar browser cada 3 lotes para evitar problemas de memoria
-        if (!browser || i % 3 === 0) {
+        if (!rotatePerPlate && (!browser || i % 3 === 0)) {
           if (browser) {
             console.log('🔄 Reiniciando navegador para mantener rendimiento...');
             await browser.close();
           }
           browser = await launchBrowser();
-          page = await preparePage(browser);
+          page = await preparePage(browser, PLACA_TARGET_URL);
         }
         
         // Procesar lote actual
         for (const placa of lote) {
           try {
             console.log(`🔍 [${requestId}] Consultando placa: ${placa} (${resultados.procesados + 1}/${listaPlacas.length})`);
+
+            if (rotatePerPlate) {
+              if (browser) {
+                try {
+                  await browser.close();
+                } catch (closeError) {
+                  console.warn(`⚠️ [${requestId}] Error cerrando navegador previo:`, closeError.message);
+                }
+              }
+
+              console.log(`🔄 [${requestId}] Rotando navegador/proxy para placa ${placa}`);
+              browser = await launchBrowser();
+              page = await preparePage(browser, PLACA_TARGET_URL);
+            }
+
+            if (logIP && page) {
+              await logCurrentPublicIP(page, `${requestId}|placa:${placa}`);
+            }
             
             // Pasar la fecha del lote y la hora de ejecución única para todas las consultas del lote
             const result = await consultarPorPlaca(page, placa, fechaLote, horaEjecucionLote);
@@ -104,8 +177,8 @@ async function procesarConsultaMasiva(listaPlacas, requestId) {
                 plate: placa,
                 chkDefaulter: result.chkDefaulter,
                 typeAccount: result.typeAccount,
-                saldo: result.balanceAmount ? result.balanceAmount / 100 : 0,
-                adeudado: result.totalAmount ? result.totalAmount / 100 : 0
+                saldo: obtenerSaldoResultado(result),
+                adeudado: obtenerAdeudadoResultado(result)
               });
             } else {
               resultados.errores.push({ plate: placa, error: result.message });
@@ -200,10 +273,14 @@ router.post('/consulta-placa-sync', authenticate, async (req, res) => {
 
   let browser = null;
   let page = null;
+  const rotatePerPlate = shouldRotateBrowserPerPlate();
+  const logIP = shouldLogPublicIPEachQuery();
 
   try {
-    browser = await launchBrowser();
-    page = await preparePage(browser);
+    if (!rotatePerPlate) {
+      browser = await launchBrowser();
+      page = await preparePage(browser, PLACA_TARGET_URL);
+    }
     
     // 🕐 Generar fecha única para este lote síncrono (hora de Panamá)
     const fechaLote = obtenerFechaPanama();
@@ -217,6 +294,24 @@ router.post('/consulta-placa-sync', authenticate, async (req, res) => {
     for (const placa of listaPlacas) {
       try {
         console.log(`🔍 Consultando placa: ${placa}`);
+
+        if (rotatePerPlate) {
+          if (browser) {
+            try {
+              await browser.close();
+            } catch (closeError) {
+              console.warn('⚠️ Error cerrando navegador previo en sync:', closeError.message);
+            }
+          }
+
+          console.log(`🔄 Rotando navegador/proxy para placa ${placa} (sync)`);
+          browser = await launchBrowser();
+          page = await preparePage(browser, PLACA_TARGET_URL);
+        }
+
+        if (logIP && page) {
+          await logCurrentPublicIP(page, `sync|placa:${placa}`);
+        }
         
         // Pasar la fecha del lote y la hora de ejecución única para todas las consultas
         const result = await consultarPorPlaca(page, placa, fechaLote, horaEjecucionLote);
@@ -226,8 +321,8 @@ router.post('/consulta-placa-sync', authenticate, async (req, res) => {
             plate: placa,
             chkDefaulter: result.chkDefaulter,
             typeAccount: result.typeAccount,
-            saldo: result.balanceAmount ? result.balanceAmount / 100 : 0,
-            adeudado: result.totalAmount ? result.totalAmount / 100 : 0
+            saldo: obtenerSaldoResultado(result),
+            adeudado: obtenerAdeudadoResultado(result)
           });
         } else {
           resultados.errores.push({ plate: placa, error: result.message });
@@ -264,7 +359,6 @@ router.post('/consulta-placa-sync', authenticate, async (req, res) => {
 const resultadosCache = new Map();
 
 // Ruta para consultar estado de procesamiento
-// Ruta para consultar estado de procesamiento
 router.get('/consulta-status/:requestId', authenticate, (req, res) => {
   const { requestId } = req.params;
   
@@ -279,7 +373,7 @@ router.get('/consulta-status/:requestId', authenticate, (req, res) => {
 
 // Ruta para consulta única SIN guardar en base de datos
 router.post('/consulta-placa-solo', authenticate, async (req, res) => {
-  const { placa } = req.body;
+  const { placa, captcha_token } = req.body;
   
   if (!placa || typeof placa !== 'string') {
     return res.status(400).json({ 
@@ -295,10 +389,14 @@ router.post('/consulta-placa-solo', authenticate, async (req, res) => {
     
     // Lanzar browser con configuración anti-detección
     browser = await launchBrowser();
-    page = await preparePage(browser);
+    page = await preparePage(browser, PLACA_TARGET_URL);
+
+    if (shouldLogPublicIPEachQuery()) {
+      await logCurrentPublicIP(page, `solo|placa:${placa}`);
+    }
     
     // Realizar consulta SIN guardar en DB
-    const resultado = await consultarPorPlacaSoloConsulta(page, placa);
+    const resultado = await consultarPorPlacaSoloConsulta(page, placa, captcha_token || null);
     
     if (resultado.success) {
       const respuesta = {
@@ -307,8 +405,8 @@ router.post('/consulta-placa-solo', authenticate, async (req, res) => {
         resultado: {
           chkDefaulter: resultado.chkDefaulter,
           typeAccount: resultado.typeAccount,
-          saldo: resultado.balanceAmount ? resultado.balanceAmount / 100 : 0,
-          adeudado: resultado.totalAmount ? resultado.totalAmount / 100 : 0
+          saldo: obtenerSaldoResultado(resultado),
+          adeudado: obtenerAdeudadoResultado(resultado)
         },
         raw_data: resultado, // Datos completos por si necesitas algo específico
         persistencia: false, // Indicar que NO se guardó en DB

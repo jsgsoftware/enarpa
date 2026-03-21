@@ -47,6 +47,8 @@ async function launchBrowser(useProxy = null, proxyUrl = null) {
       args.push(`--proxy-server=${proxy}`);
       console.log('🌐 Usando proxy:', proxy);
     }
+  } else if (shouldUseProxy && !hasProxies()) {
+    console.log('⚠️ ENABLE_PROXIES=true pero PROXY_LIST está vacía. Se usará IP del servidor.');
   }
 
   return await puppeteer.launch({
@@ -56,8 +58,9 @@ async function launchBrowser(useProxy = null, proxyUrl = null) {
   });
 }
 
-async function preparePage(browser) {
+async function preparePage(browser, targetUrl = null) {
   const page = await browser.newPage();
+  const urlObjetivo = targetUrl || process.env.TARGET_URL || 'https://ena.com.pa/consulta-tu-saldo';
 
   // Configurar User Agent aleatorio
   const userAgent = getRandomUserAgent();
@@ -113,7 +116,7 @@ async function preparePage(browser) {
     // Delay aleatorio antes de navegar
     await new Promise(r => setTimeout(r, randomDelay(500, 2000)));
 
-    await page.goto('https://ena.com.pa/consulta-tu-saldo', {
+    await page.goto(urlObjetivo, {
       waitUntil: 'networkidle2',
       timeout: 90000 // Aumentamos el timeout
     });
@@ -131,4 +134,48 @@ async function preparePage(browser) {
   }, maxRetries, 2000);
 }
 
-module.exports = { launchBrowser, preparePage, randomDelay };
+async function getPublicIPFromPage(page) {
+  try {
+    return await page.evaluate(async () => {
+      const endpoints = [
+        'https://api64.ipify.org?format=json',
+        'https://api.ipify.org?format=json'
+      ];
+
+      for (const endpoint of endpoints) {
+        try {
+          const response = await fetch(endpoint, { method: 'GET' });
+          if (!response.ok) {
+            continue;
+          }
+
+          const data = await response.json();
+          if (data && data.ip) {
+            return data.ip;
+          }
+        } catch (error) {
+          // Probar siguiente endpoint
+        }
+      }
+
+      return null;
+    });
+  } catch (error) {
+    return null;
+  }
+}
+
+async function logCurrentPublicIP(page, label = '') {
+  const ip = await getPublicIPFromPage(page);
+  const prefix = label ? ` [${label}]` : '';
+
+  if (ip) {
+    console.log(`🌍 IP pública detectada${prefix}: ${ip}`);
+  } else {
+    console.log(`⚠️ No se pudo detectar IP pública${prefix}`);
+  }
+
+  return ip;
+}
+
+module.exports = { launchBrowser, preparePage, randomDelay, logCurrentPublicIP };

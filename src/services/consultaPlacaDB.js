@@ -1,6 +1,50 @@
 const { query, getClient } = require('../config/database');
 const { obtenerFechaPanama, obtenerHoraPanamaFormato } = require('../utils/timezone');
 
+function normalizarMonto(valor) {
+  if (valor === null || valor === undefined || valor === '') {
+    return 0;
+  }
+
+  const numero = Number(valor);
+  if (!Number.isFinite(numero)) {
+    return 0;
+  }
+
+  return numero >= 100 ? numero / 100 : numero;
+}
+
+function extraerMontoDesdeTexto(texto) {
+  if (!texto || typeof texto !== 'string') {
+    return null;
+  }
+
+  const match = texto.match(/B\/\.?\s*([0-9]+(?:[.,][0-9]{1,2})?)/i);
+  if (!match || !match[1]) {
+    return null;
+  }
+
+  const numero = Number(match[1].replace(',', '.'));
+  return Number.isFinite(numero) ? numero : null;
+}
+
+function obtenerSaldoResultado(resultado) {
+  if (resultado && resultado.balanceAmount !== null && resultado.balanceAmount !== undefined && resultado.balanceAmount !== '') {
+    return normalizarMonto(resultado.balanceAmount);
+  }
+
+  const montoDesdeMensaje = extraerMontoDesdeTexto(resultado && resultado.message);
+  return montoDesdeMensaje !== null ? montoDesdeMensaje : 0;
+}
+
+function obtenerAdeudadoResultado(resultado) {
+  if (resultado && resultado.totalAmount !== null && resultado.totalAmount !== undefined && resultado.totalAmount !== '') {
+    return normalizarMonto(resultado.totalAmount);
+  }
+
+  return 0;
+}
+
 /**
  * Servicio para manejar la persistencia de consultas de placas en PostgreSQL
  */
@@ -119,8 +163,8 @@ class ConsultaPlacaService {
         success: resultado.success,
         chkDefaulter: resultado.chkDefaulter,
         typeAccount: resultado.typeAccount,
-        saldo: resultado.balanceAmount ? resultado.balanceAmount / 100 : 0,
-        adeudado: resultado.totalAmount ? resultado.totalAmount / 100 : 0,
+        saldo: obtenerSaldoResultado(resultado),
+        adeudado: obtenerAdeudadoResultado(resultado),
         error: resultado.success ? null : resultado.message
       };
       
