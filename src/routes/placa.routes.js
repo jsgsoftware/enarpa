@@ -13,12 +13,17 @@ function normalizarMonto(valor) {
     return 0;
   }
 
-  const numero = Number(valor);
+  const valorTexto = String(valor).trim();
+  const numero = Number(valorTexto.replace(',', '.'));
   if (!Number.isFinite(numero)) {
     return 0;
   }
 
-  return numero >= 100 ? numero / 100 : numero;
+  if (valorTexto.includes('.') || valorTexto.includes(',')) {
+    return numero;
+  }
+
+  return numero / 100;
 }
 
 function extraerMontoDesdeTexto(texto) {
