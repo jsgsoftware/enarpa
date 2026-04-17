@@ -1,6 +1,6 @@
 const express = require('express');
 const authenticate = require('../middleware/auth');
-const { launchBrowser, preparePage, randomDelay, logCurrentPublicIP } = require('../services/browser');
+const { launchBrowser, preparePage, randomDelay, logCurrentPublicIP, closeBrowserResources } = require('../services/browser');
 const { consultarPorPlaca, consultarPorPlacaSoloConsulta } = require('../services/placa');
 const consultaPlacaDB = require('../services/consultaPlacaDB');
 const { obtenerFechaPanama, obtenerHoraPanamaFormato, obtenerFechaPanamaISO } = require('../utils/timezone');
@@ -145,7 +145,9 @@ async function procesarConsultaMasiva(listaPlacas, requestId) {
         if (!rotatePerPlate && (!browser || i % 3 === 0)) {
           if (browser) {
             console.log('🔄 Reiniciando navegador para mantener rendimiento...');
-            await browser.close();
+            await closeBrowserResources(page, browser, `${requestId}|reinicio-lote`);
+            browser = null;
+            page = null;
           }
           browser = await launchBrowser();
           page = await preparePage(browser, PLACA_TARGET_URL);
@@ -158,11 +160,9 @@ async function procesarConsultaMasiva(listaPlacas, requestId) {
 
             if (rotatePerPlate) {
               if (browser) {
-                try {
-                  await browser.close();
-                } catch (closeError) {
-                  console.warn(`⚠️ [${requestId}] Error cerrando navegador previo:`, closeError.message);
-                }
+                await closeBrowserResources(page, browser, `${requestId}|rotacion:${placa}`);
+                browser = null;
+                page = null;
               }
 
               console.log(`🔄 [${requestId}] Rotando navegador/proxy para placa ${placa}`);
@@ -255,7 +255,7 @@ async function procesarConsultaMasiva(listaPlacas, requestId) {
   } finally {
     if (browser) {
       try {
-        await browser.close();
+        await closeBrowserResources(page, browser, `${requestId}|final`);
       } catch (closeError) {
         console.error(`❌ [${requestId}] Error al cerrar navegador:`, closeError.message);
       }
@@ -302,11 +302,9 @@ router.post('/consulta-placa-sync', authenticate, async (req, res) => {
 
         if (rotatePerPlate) {
           if (browser) {
-            try {
-              await browser.close();
-            } catch (closeError) {
-              console.warn('⚠️ Error cerrando navegador previo en sync:', closeError.message);
-            }
+            await closeBrowserResources(page, browser, `sync|rotacion:${placa}`);
+            browser = null;
+            page = null;
           }
 
           console.log(`🔄 Rotando navegador/proxy para placa ${placa} (sync)`);
@@ -352,7 +350,7 @@ router.post('/consulta-placa-sync', authenticate, async (req, res) => {
   } finally {
     if (browser) {
       try {
-        await browser.close();
+        await closeBrowserResources(page, browser, 'sync|final');
       } catch (closeError) {
         console.error('❌ Error al cerrar navegador:', closeError.message);
       }
@@ -446,7 +444,7 @@ router.post('/consulta-placa-solo', authenticate, async (req, res) => {
   } finally {
     if (browser) {
       try {
-        await browser.close();
+        await closeBrowserResources(page, browser, `solo|placa:${placa}`);
       } catch (closeError) {
         console.error('❌ Error al cerrar navegador:', closeError.message);
       }

@@ -1,6 +1,12 @@
 const puppeteer = require('puppeteer');
+const fs = require('fs/promises');
+const os = require('os');
+const path = require('path');
 const { getRandomProxy, hasProxies } = require('../config/proxies');
 const { getRandomHeaders, retryWithBackoff } = require('../utils/antiDetection');
+
+const BROWSER_TMP_ROOT = process.env.BROWSER_TMP_ROOT || path.join(os.tmpdir(), 'enarpa-browser');
+const activeBrowserResources = new Set();
 
 // Lista de User Agents para rotar
 const USER_AGENTS = [
@@ -23,8 +29,75 @@ function randomDelay(min = null, max = null) {
   return Math.floor(Math.random() * (maxDelay - minDelay + 1)) + minDelay;
 }
 
+async function ensureDir(dirPath) {
+  await fs.mkdir(dirPath, { recursive: true });
+}
+
+async function createBrowserRuntimeDirs() {
+  await ensureDir(BROWSER_TMP_ROOT);
+
+  const sessionRoot = await fs.mkdtemp(path.join(BROWSER_TMP_ROOT, 'session-'));
+  const userDataDir = path.join(sessionRoot, 'profile');
+  const cacheDir = path.join(sessionRoot, 'cache');
+  const downloadsDir = path.join(sessionRoot, 'downloads');
+  const crashDir = path.join(sessionRoot, 'crashpad');
+
+  await Promise.all([
+    ensureDir(userDataDir),
+    ensureDir(cacheDir),
+    ensureDir(downloadsDir),
+    ensureDir(crashDir)
+  ]);
+
+  return {
+    sessionRoot,
+    userDataDir,
+    cacheDir,
+    downloadsDir,
+    crashDir
+  };
+}
+
+async function removeBrowserTempDir(resource) {
+  if (!resource || !resource.sessionRoot) {
+    return;
+  }
+
+  try {
+    await fs.rm(resource.sessionRoot, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 });
+    console.log(`🧹 Runtime temporal de browser eliminado: ${resource.sessionRoot}`);
+  } catch (error) {
+    console.warn(`⚠️ No se pudo eliminar runtime temporal ${resource.sessionRoot}:`, error.message);
+  }
+}
+
+function attachBrowserCleanup(browser, resource) {
+  let cleaned = false;
+
+  const cleanup = async () => {
+    if (cleaned) {
+      return;
+    }
+
+    cleaned = true;
+    activeBrowserResources.delete(resource);
+    await removeBrowserTempDir(resource);
+  };
+
+  browser.once('disconnected', () => {
+    cleanup().catch(error => {
+      console.warn('⚠️ Error limpiando runtime temporal tras disconnect:', error.message);
+    });
+  });
+
+  browser.__enarpaCleanup = cleanup;
+  browser.__enarpaResource = resource;
+  activeBrowserResources.add(resource);
+}
+
 async function launchBrowser(useProxy = null, proxyUrl = null) {
   const shouldUseProxy = useProxy !== null ? useProxy : process.env.ENABLE_PROXIES === 'true';
+  const runtimeDirs = await createBrowserRuntimeDirs();
   
   const args = [
     '--no-sandbox',
@@ -37,7 +110,14 @@ async function launchBrowser(useProxy = null, proxyUrl = null) {
     '--ignore-certificate-errors',
     '--disable-web-security',
     '--disable-features=VizDisplayCompositor',
-    '--disable-blink-features=AutomationControlled'
+    '--disable-blink-features=AutomationControlled',
+    '--disable-crash-reporter',
+    '--disable-breakpad',
+    '--disable-logging',
+    '--metrics-recording-only',
+    `--disk-cache-dir=${runtimeDirs.cacheDir}`,
+    `--homedir=${runtimeDirs.userDataDir}`,
+    `--crash-dumps-dir=${runtimeDirs.crashDir}`
   ];
 
   // Usar proxy si está disponible y habilitado
@@ -51,16 +131,35 @@ async function launchBrowser(useProxy = null, proxyUrl = null) {
     console.log('⚠️ ENABLE_PROXIES=true pero PROXY_LIST está vacía. Se usará IP del servidor.');
   }
 
-  return await puppeteer.launch({
-    headless: true,
-    ignoreHTTPSErrors: true,
-    args
-  });
+  try {
+    const browser = await puppeteer.launch({
+      headless: true,
+      ignoreHTTPSErrors: true,
+      userDataDir: runtimeDirs.userDataDir,
+      args,
+      env: {
+        ...process.env,
+        TMPDIR: runtimeDirs.sessionRoot,
+        TMP: runtimeDirs.sessionRoot,
+        TEMP: runtimeDirs.sessionRoot,
+        XDG_CACHE_HOME: runtimeDirs.cacheDir,
+        XDG_CONFIG_HOME: runtimeDirs.userDataDir
+      }
+    });
+
+    attachBrowserCleanup(browser, runtimeDirs);
+    console.log(`🗂️ Runtime temporal de browser: ${runtimeDirs.sessionRoot}`);
+    return browser;
+  } catch (error) {
+    await removeBrowserTempDir(runtimeDirs);
+    throw error;
+  }
 }
 
 async function preparePage(browser, targetUrl = null) {
   const page = await browser.newPage();
   const urlObjetivo = targetUrl || process.env.TARGET_URL || 'https://ena.com.pa/consulta-tu-saldo';
+  const browserResource = browser.__enarpaResource;
 
   // Configurar User Agent aleatorio
   const userAgent = getRandomUserAgent();
@@ -80,6 +179,18 @@ async function preparePage(browser, targetUrl = null) {
   // Configurar headers aleatorios
   const headers = getRandomHeaders();
   await page.setExtraHTTPHeaders(headers);
+
+  if (browserResource && browserResource.downloadsDir) {
+    try {
+      const client = await page.target().createCDPSession();
+      await client.send('Page.setDownloadBehavior', {
+        behavior: 'deny',
+        downloadPath: browserResource.downloadsDir
+      });
+    } catch (error) {
+      console.warn('⚠️ No se pudo configurar política de descargas del browser:', error.message);
+    }
+  }
 
   // Ocultar que es un navegador automatizado
   await page.evaluateOnNewDocument(() => {
@@ -178,4 +289,54 @@ async function logCurrentPublicIP(page, label = '') {
   return ip;
 }
 
-module.exports = { launchBrowser, preparePage, randomDelay, logCurrentPublicIP };
+async function closeBrowserResources(page = null, browser = null, label = '') {
+  const prefix = label ? ` [${label}]` : '';
+
+  if (page) {
+    try {
+      if (!page.isClosed()) {
+        await page.close({ runBeforeUnload: false });
+      }
+    } catch (error) {
+      console.warn(`⚠️ Error cerrando page${prefix}:`, error.message);
+    }
+  }
+
+  if (browser) {
+    try {
+      if (browser.connected) {
+        await browser.close();
+      }
+    } catch (error) {
+      console.warn(`⚠️ Error cerrando browser${prefix}:`, error.message);
+      try {
+        await browser.disconnect();
+      } catch (disconnectError) {
+        console.warn(`⚠️ Error desconectando browser${prefix}:`, disconnectError.message);
+      }
+    }
+
+    if (typeof browser.__enarpaCleanup === 'function') {
+      try {
+        await browser.__enarpaCleanup();
+      } catch (cleanupError) {
+        console.warn(`⚠️ Error limpiando temporales de browser${prefix}:`, cleanupError.message);
+      }
+    }
+  }
+}
+
+async function cleanupAllBrowserResources() {
+  const resources = Array.from(activeBrowserResources);
+  await Promise.all(resources.map(resource => removeBrowserTempDir(resource)));
+  activeBrowserResources.clear();
+}
+
+module.exports = {
+  launchBrowser,
+  preparePage,
+  randomDelay,
+  logCurrentPublicIP,
+  closeBrowserResources,
+  cleanupAllBrowserResources
+};

@@ -134,6 +134,9 @@ docker image prune
 - `CLIENT_ID`: ID del cliente para autenticación
 - `CLIENT_SECRET`: Secret del cliente para autenticación
 - `NODE_ENV`: Entorno de ejecución (production/development)
+- `BROWSER_TMP_ROOT`: Directorio temporal de Chromium/Puppeteer (default: `/tmp/enarpa-browser`)
+- `RECAPTCHA_MAX_RETRIES`: Reintentos para consultas bloqueadas por captcha
+- `RECAPTCHA_RETRY_BASE_DELAY_MS`: Backoff base entre reintentos del scraper
 
 ### Personalizar Docker Compose
 Puedes modificar `docker-compose.yml` para:
@@ -144,6 +147,36 @@ Puedes modificar `docker-compose.yml` para:
 
 ### Health Check
 El contenedor incluye un health check que verifica cada 30 segundos si la aplicación responde correctamente.
+
+## Producción y Disco
+
+El scraper de Puppeteer/Chromium nunca debe escribir temporales dentro de `/app`.
+
+- El contenedor arranca con `ulimit -c 0` para impedir `core dumps`.
+- Los perfiles, cachés y descargas del browser se crean en `BROWSER_TMP_ROOT` (por defecto `/tmp/enarpa-browser`).
+- Cada browser elimina su runtime temporal al cerrarse, incluso en cierres parciales.
+
+Recomendaciones operativas:
+
+- No uses `/app` para temporales ni perfiles del navegador.
+- Monitorea el crecimiento de `/tmp` y del writable layer del contenedor.
+- Si haces despliegues con Docker, es recomendable revisar `docker system df` y `docker ps -s` periódicamente.
+
+Comandos útiles de monitoreo:
+
+```bash
+# Uso del writable layer del contenedor
+docker ps -s
+
+# Uso total de Docker en el host
+docker system df
+
+# Revisar temporales del browser dentro del contenedor
+docker exec -it ena-api sh -lc 'du -sh /tmp /tmp/enarpa-browser 2>/dev/null || true'
+
+# Buscar archivos core si hubo un incidente
+docker exec -it ena-api sh -lc 'find /app /tmp -maxdepth 2 -name "core.*" -o -name "core"'
+```
 
 ## 🐛 Troubleshooting
 

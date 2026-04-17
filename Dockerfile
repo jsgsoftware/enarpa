@@ -3,8 +3,6 @@ FROM node:18-slim
 
 # Instalar dependencias del sistema necesarias para Puppeteer
 RUN apt-get update \
-    && apt-get install -y wget gnupg \
-    && wget -q -O - https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/APKINDEX.tar.gz || true \
     && apt-get install -y \
         fonts-liberation \
         libappindicator3-1 \
@@ -30,6 +28,12 @@ RUN apt-get update \
 # Crear directorio de trabajo
 WORKDIR /app
 
+# Rutas temporales fuera de /app para Chromium/Puppeteer
+ENV TMPDIR=/tmp \
+    TMP=/tmp \
+    TEMP=/tmp \
+    BROWSER_TMP_ROOT=/tmp/enarpa-browser
+
 # Configurar Puppeteer para descargar Chromium
 ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=false
 
@@ -39,6 +43,10 @@ COPY package*.json ./
 # Copiar el resto del código
 COPY . .
 
+# Entry point para desactivar core dumps y preparar temporales
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN sed -i 's/\r$//' /usr/local/bin/docker-entrypoint.sh && chmod +x /usr/local/bin/docker-entrypoint.sh
+
 # Configurar npm para SSL y instalar dependencias
 RUN npm config set strict-ssl false
 RUN npm install
@@ -47,4 +55,5 @@ RUN npm install
 EXPOSE 3000
 
 # Comando para iniciar la aplicación
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["node", "server.js"]

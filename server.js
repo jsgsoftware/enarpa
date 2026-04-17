@@ -2,6 +2,7 @@
 const express = require('express');
 const cors = require('cors');
 const dotenv = require('dotenv');
+const { cleanupAllBrowserResources } = require('./src/services/browser');
 
 // Carga variables de entorno
 dotenv.config();
@@ -124,7 +125,8 @@ server.headersTimeout = 660000; // 11 minutos
 // Manejo graceful de shutdown
 process.on('SIGTERM', () => {
   console.log('🛑 Recibida señal SIGTERM, cerrando servidor...');
-  server.close(() => {
+  server.close(async () => {
+    await cleanupAllBrowserResources();
     console.log('✅ Servidor cerrado correctamente');
     process.exit(0);
   });
@@ -132,7 +134,8 @@ process.on('SIGTERM', () => {
 
 process.on('SIGINT', () => {
   console.log('🛑 Recibida señal SIGINT, cerrando servidor...');
-  server.close(() => {
+  server.close(async () => {
+    await cleanupAllBrowserResources();
     console.log('✅ Servidor cerrado correctamente');
     process.exit(0);
   });
