@@ -1,6 +1,14 @@
 const express = require('express');
 const authenticate = require('../middleware/auth');
-const { launchBrowser, preparePage, randomDelay, logCurrentPublicIP, closeBrowserResources } = require('../services/browser');
+const {
+  createBrowserSession,
+  safeCloseBrowserSession,
+  markBrowserSessionSuccess,
+  markBrowserSessionError,
+  shouldRecycleBrowserSession,
+  randomDelay,
+  logCurrentPublicIP
+} = require('../services/browser');
 const { consultarPorPlaca, consultarPorPlacaSoloConsulta } = require('../services/placa');
 const consultaPlacaDB = require('../services/consultaPlacaDB');
 const { obtenerFechaPanama, obtenerHoraPanamaFormato, obtenerFechaPanamaISO } = require('../utils/timezone');
@@ -65,6 +73,27 @@ function shouldLogPublicIPEachQuery() {
   return process.env.LOG_PUBLIC_IP_EACH_QUERY === 'true';
 }
 
+function getBrowserRecyclePolicy() {
+  return {
+    maxBatches: parseInt(process.env.BROWSER_MAX_BATCHES_PER_SESSION || '3', 10),
+    maxPlates: parseInt(process.env.BROWSER_MAX_PLATES_PER_SESSION || '15', 10),
+    maxAgeMs: parseInt(process.env.BROWSER_MAX_AGE_MS || '900000', 10),
+    maxConsecutiveErrors: parseInt(process.env.BROWSER_MAX_CONSECUTIVE_ERRORS || '2', 10),
+    maxConsecutiveRecaptchaErrors: parseInt(process.env.BROWSER_MAX_CONSECUTIVE_RECAPTCHA_ERRORS || '2', 10)
+  };
+}
+
+async function startPlacaBrowserSession(label, requestId, loteIndex = null) {
+  return await createBrowserSession({
+    targetUrl: PLACA_TARGET_URL,
+    label,
+    metadata: {
+      requestId,
+      loteIndex
+    }
+  });
+}
+
 // Función para procesar placas en lotes
 async function procesarLotesDePlacas(placas, batchSize = 10) {
   const lotes = [];
@@ -105,10 +134,10 @@ router.post('/consulta-placa', authenticate, async (req, res) => {
 
 // Función para procesar consulta masiva en background
 async function procesarConsultaMasiva(listaPlacas, requestId) {
-  let browser = null;
-  let page = null;
+  let session = null;
   const rotatePerPlate = shouldRotateBrowserPerPlate();
   const logIP = shouldLogPublicIPEachQuery();
+  const recyclePolicy = getBrowserRecyclePolicy();
   const resultados = { 
     requestId,
     consultados: [], 
@@ -141,16 +170,18 @@ async function procesarConsultaMasiva(listaPlacas, requestId) {
       console.log(`🕰️ Hora de ejecución del lote ${i + 1}: ${horaEjecucionLote} (Panamá)`);
       
       try {
-        // Reiniciar browser cada 3 lotes para evitar problemas de memoria
-        if (!rotatePerPlate && (!browser || i % 3 === 0)) {
-          if (browser) {
-            console.log('🔄 Reiniciando navegador para mantener rendimiento...');
-            await closeBrowserResources(page, browser, `${requestId}|reinicio-lote`);
-            browser = null;
-            page = null;
+        if (!rotatePerPlate) {
+          const recycleCheck = shouldRecycleBrowserSession(session, recyclePolicy);
+          if (session && recycleCheck.recycle) {
+            console.log(`🔄 [${requestId}] Reiniciando browser antes del lote ${i + 1}: ${recycleCheck.reasons.join(', ')}`);
+            session.metrics.reiniciosSolicitados += 1;
+            await safeCloseBrowserSession(session, `${requestId}|pre-lote-${i + 1}`);
+            session = null;
           }
-          browser = await launchBrowser();
-          page = await preparePage(browser, PLACA_TARGET_URL);
+
+          if (!session) {
+            session = await startPlacaBrowserSession(`${requestId}|lote:${i + 1}`, requestId, i + 1);
+          }
         }
         
         // Procesar lote actual
@@ -159,23 +190,36 @@ async function procesarConsultaMasiva(listaPlacas, requestId) {
             console.log(`🔍 [${requestId}] Consultando placa: ${placa} (${resultados.procesados + 1}/${listaPlacas.length})`);
 
             if (rotatePerPlate) {
-              if (browser) {
-                await closeBrowserResources(page, browser, `${requestId}|rotacion:${placa}`);
-                browser = null;
-                page = null;
+              if (session) {
+                session.metrics.reiniciosSolicitados += 1;
+                await safeCloseBrowserSession(session, `${requestId}|rotacion:${placa}`);
+                session = null;
               }
 
               console.log(`🔄 [${requestId}] Rotando navegador/proxy para placa ${placa}`);
-              browser = await launchBrowser();
-              page = await preparePage(browser, PLACA_TARGET_URL);
+              session = await startPlacaBrowserSession(`${requestId}|placa:${placa}`, requestId, i + 1);
             }
 
-            if (logIP && page) {
-              await logCurrentPublicIP(page, `${requestId}|placa:${placa}`);
+            if (!rotatePerPlate && session) {
+              const recycleCheck = shouldRecycleBrowserSession(session, recyclePolicy);
+              if (recycleCheck.recycle) {
+                console.log(`🔄 [${requestId}] Reiniciando browser antes de placa ${placa}: ${recycleCheck.reasons.join(', ')}`);
+                session.metrics.reiniciosSolicitados += 1;
+                await safeCloseBrowserSession(session, `${requestId}|pre-placa:${placa}`);
+                session = null;
+              }
+            }
+
+            if (!session) {
+              session = await startPlacaBrowserSession(`${requestId}|lote:${i + 1}`, requestId, i + 1);
+            }
+
+            if (logIP && session.page) {
+              await logCurrentPublicIP(session.page, `${requestId}|placa:${placa}|session:${session.id}`);
             }
             
             // Pasar la fecha del lote y la hora de ejecución única para todas las consultas del lote
-            const result = await consultarPorPlaca(page, placa, fechaLote, horaEjecucionLote);
+            const result = await consultarPorPlaca(session.page, placa, fechaLote, horaEjecucionLote);
             
             if (result.success) {
               resultados.consultados.push({
@@ -188,6 +232,8 @@ async function procesarConsultaMasiva(listaPlacas, requestId) {
             } else {
               resultados.errores.push({ plate: placa, error: result.message });
             }
+
+            markBrowserSessionSuccess(session, { incrementPlates: 1, placa });
             
             resultados.procesados++;
             
@@ -200,13 +246,24 @@ async function procesarConsultaMasiva(listaPlacas, requestId) {
             
           } catch (err) {
             console.error(`❌ [${requestId}] Error en ${placa}:`, err.message);
+            markBrowserSessionError(session, err, { placa });
             resultados.errores.push({ plate: placa, error: 'Error inesperado en la consulta' });
             resultados.procesados++;
             
             // Actualizar cache con error
             resultadosCache.set(requestId, { ...resultados });
+
+            const recycleCheck = shouldRecycleBrowserSession(session, recyclePolicy);
+            if (session && recycleCheck.recycle) {
+              console.log(`🔄 [${requestId}] Reiniciando browser tras error en ${placa}: ${recycleCheck.reasons.join(', ')}`);
+              session.metrics.reiniciosSolicitados += 1;
+              await safeCloseBrowserSession(session, `${requestId}|error:${placa}`);
+              session = null;
+            }
           }
         }
+
+        markBrowserSessionSuccess(session, { incrementBatches: 1 });
         
         // Delay más largo entre lotes
         if (i < lotes.length - 1) {
@@ -253,9 +310,9 @@ async function procesarConsultaMasiva(listaPlacas, requestId) {
     // Actualizar cache con error
     resultadosCache.set(requestId, { ...resultados });
   } finally {
-    if (browser) {
+    if (session) {
       try {
-        await closeBrowserResources(page, browser, `${requestId}|final`);
+        await safeCloseBrowserSession(session, `${requestId}|final`);
       } catch (closeError) {
         console.error(`❌ [${requestId}] Error al cerrar navegador:`, closeError.message);
       }
@@ -276,15 +333,14 @@ router.post('/consulta-placa-sync', authenticate, async (req, res) => {
     });
   }
 
-  let browser = null;
-  let page = null;
+  let session = null;
   const rotatePerPlate = shouldRotateBrowserPerPlate();
   const logIP = shouldLogPublicIPEachQuery();
+  const recyclePolicy = getBrowserRecyclePolicy();
 
   try {
     if (!rotatePerPlate) {
-      browser = await launchBrowser();
-      page = await preparePage(browser, PLACA_TARGET_URL);
+      session = await startPlacaBrowserSession('sync|inicio', 'sync', 1);
     }
     
     // 🕐 Generar fecha única para este lote síncrono (hora de Panamá)
@@ -301,23 +357,36 @@ router.post('/consulta-placa-sync', authenticate, async (req, res) => {
         console.log(`🔍 Consultando placa: ${placa}`);
 
         if (rotatePerPlate) {
-          if (browser) {
-            await closeBrowserResources(page, browser, `sync|rotacion:${placa}`);
-            browser = null;
-            page = null;
+          if (session) {
+            session.metrics.reiniciosSolicitados += 1;
+            await safeCloseBrowserSession(session, `sync|rotacion:${placa}`);
+            session = null;
           }
 
           console.log(`🔄 Rotando navegador/proxy para placa ${placa} (sync)`);
-          browser = await launchBrowser();
-          page = await preparePage(browser, PLACA_TARGET_URL);
+          session = await startPlacaBrowserSession(`sync|placa:${placa}`, 'sync', 1);
         }
 
-        if (logIP && page) {
-          await logCurrentPublicIP(page, `sync|placa:${placa}`);
+        if (!rotatePerPlate && session) {
+          const recycleCheck = shouldRecycleBrowserSession(session, recyclePolicy);
+          if (recycleCheck.recycle) {
+            console.log(`🔄 Reiniciando browser sync antes de ${placa}: ${recycleCheck.reasons.join(', ')}`);
+            session.metrics.reiniciosSolicitados += 1;
+            await safeCloseBrowserSession(session, `sync|pre-placa:${placa}`);
+            session = null;
+          }
+        }
+
+        if (!session) {
+          session = await startPlacaBrowserSession('sync|recuperacion', 'sync', 1);
+        }
+
+        if (logIP && session.page) {
+          await logCurrentPublicIP(session.page, `sync|placa:${placa}|session:${session.id}`);
         }
         
         // Pasar la fecha del lote y la hora de ejecución única para todas las consultas
-        const result = await consultarPorPlaca(page, placa, fechaLote, horaEjecucionLote);
+        const result = await consultarPorPlaca(session.page, placa, fechaLote, horaEjecucionLote);
         
         if (result.success) {
           resultados.consultados.push({
@@ -330,6 +399,8 @@ router.post('/consulta-placa-sync', authenticate, async (req, res) => {
         } else {
           resultados.errores.push({ plate: placa, error: result.message });
         }
+
+        markBrowserSessionSuccess(session, { incrementPlates: 1, placa });
         
         // Delay entre consultas
         const delay = randomDelay(1500, 3000);
@@ -338,9 +409,20 @@ router.post('/consulta-placa-sync', authenticate, async (req, res) => {
         
       } catch (err) {
         console.error(`❌ Error en ${placa}:`, err.message);
+        markBrowserSessionError(session, err, { placa });
         resultados.errores.push({ plate: placa, error: 'Error inesperado en la consulta' });
+
+        const recycleCheck = shouldRecycleBrowserSession(session, recyclePolicy);
+        if (session && recycleCheck.recycle) {
+          console.log(`🔄 Reiniciando browser sync tras error en ${placa}: ${recycleCheck.reasons.join(', ')}`);
+          session.metrics.reiniciosSolicitados += 1;
+          await safeCloseBrowserSession(session, `sync|error:${placa}`);
+          session = null;
+        }
       }
     }
+
+    markBrowserSessionSuccess(session, { incrementBatches: 1 });
     
     res.json(resultados);
     
@@ -348,9 +430,9 @@ router.post('/consulta-placa-sync', authenticate, async (req, res) => {
     console.error('❌ Error general:', error.message);
     res.status(500).json({ error: 'Error interno del servidor', details: error.message });
   } finally {
-    if (browser) {
+    if (session) {
       try {
-        await closeBrowserResources(page, browser, 'sync|final');
+        await safeCloseBrowserSession(session, 'sync|final');
       } catch (closeError) {
         console.error('❌ Error al cerrar navegador:', closeError.message);
       }
@@ -384,22 +466,21 @@ router.post('/consulta-placa-solo', authenticate, async (req, res) => {
     });
   }
 
-  let browser = null;
-  let page = null;
+  let session = null;
 
   try {
     console.log(`🔍 Iniciando consulta sin persistencia para placa: ${placa}`);
     
     // Lanzar browser con configuración anti-detección
-    browser = await launchBrowser();
-    page = await preparePage(browser, PLACA_TARGET_URL);
+    session = await startPlacaBrowserSession(`solo|placa:${placa}`, 'solo', 1);
 
     if (shouldLogPublicIPEachQuery()) {
-      await logCurrentPublicIP(page, `solo|placa:${placa}`);
+      await logCurrentPublicIP(session.page, `solo|placa:${placa}|session:${session.id}`);
     }
     
     // Realizar consulta SIN guardar en DB
-    const resultado = await consultarPorPlacaSoloConsulta(page, placa, captcha_token || null);
+    const resultado = await consultarPorPlacaSoloConsulta(session.page, placa, captcha_token || null);
+    markBrowserSessionSuccess(session, { incrementPlates: 1, incrementBatches: 1, placa });
     
     if (resultado.success) {
       const respuesta = {
@@ -432,6 +513,7 @@ router.post('/consulta-placa-solo', authenticate, async (req, res) => {
     }
     
   } catch (error) {
+    markBrowserSessionError(session, error, { placa });
     console.error(`❌ Error general en consulta sin persistencia para ${placa}:`, error.message);
     res.status(500).json({ 
       placa: placa,
@@ -442,9 +524,9 @@ router.post('/consulta-placa-solo', authenticate, async (req, res) => {
       mensaje: 'Error interno (sin guardar en base de datos)'
     });
   } finally {
-    if (browser) {
+    if (session) {
       try {
-        await closeBrowserResources(page, browser, `solo|placa:${placa}`);
+        await safeCloseBrowserSession(session, `solo|placa:${placa}`);
       } catch (closeError) {
         console.error('❌ Error al cerrar navegador:', closeError.message);
       }

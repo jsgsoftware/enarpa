@@ -7,6 +7,7 @@ const { getRandomHeaders, retryWithBackoff } = require('../utils/antiDetection')
 
 const BROWSER_TMP_ROOT = process.env.BROWSER_TMP_ROOT || path.join(os.tmpdir(), 'enarpa-browser');
 const activeBrowserResources = new Set();
+let browserSessionCounter = 0;
 
 // Lista de User Agents para rotar
 const USER_AGENTS = [
@@ -289,6 +290,32 @@ async function logCurrentPublicIP(page, label = '') {
   return ip;
 }
 
+function nextBrowserSessionId() {
+  browserSessionCounter += 1;
+  return `browser_${Date.now()}_${browserSessionCounter}`;
+}
+
+function classifyBrowserError(error) {
+  const message = String(error && error.message ? error.message : error || '').toLowerCase();
+
+  if (message.includes('recaptcha') && message.includes('inv')) {
+    return 'recaptcha_invalid';
+  }
+
+  if (message.includes('navigation') || message.includes('timeout') || message.includes('networkidle')) {
+    return 'navigation';
+  }
+
+  return 'generic';
+}
+
+function createSessionLog(label, event, data = {}) {
+  console.log(`🧭 BrowserSession ${event}:`, {
+    label,
+    ...data
+  });
+}
+
 async function closeBrowserResources(page = null, browser = null, label = '') {
   const prefix = label ? ` [${label}]` : '';
 
@@ -326,6 +353,163 @@ async function closeBrowserResources(page = null, browser = null, label = '') {
   }
 }
 
+async function createBrowserSession(options = {}) {
+  const {
+    targetUrl = null,
+    useProxy = null,
+    proxyUrl = null,
+    label = 'browser-session',
+    metadata = {}
+  } = options;
+
+  const sessionId = nextBrowserSessionId();
+  const browser = await launchBrowser(useProxy, proxyUrl);
+  const page = await preparePage(browser, targetUrl);
+  const now = Date.now();
+
+  const session = {
+    id: sessionId,
+    label,
+    browser,
+    page,
+    userDataDir: browser.__enarpaResource ? browser.__enarpaResource.userDataDir : null,
+    sessionRoot: browser.__enarpaResource ? browser.__enarpaResource.sessionRoot : null,
+    createdAt: new Date(now).toISOString(),
+    createdAtMs: now,
+    lastUsedAtMs: now,
+    metadata: { ...metadata },
+    metrics: {
+      lotesProcesados: 0,
+      placasProcesadas: 0,
+      erroresConsecutivos: 0,
+      recaptchaInvalidoConsecutivo: 0,
+      reiniciosSolicitados: 0,
+      ultimoErrorTipo: null,
+      ultimoErrorMensaje: null,
+      ultimaPlaca: null
+    }
+  };
+
+  createSessionLog(label, 'started', {
+    sessionId,
+    sessionRoot: session.sessionRoot,
+    userDataDir: session.userDataDir,
+    metadata: session.metadata
+  });
+
+  return session;
+}
+
+function markBrowserSessionSuccess(session, details = {}) {
+  if (!session) {
+    return;
+  }
+
+  session.lastUsedAtMs = Date.now();
+  session.metrics.placasProcesadas += details.incrementPlates || 0;
+  session.metrics.lotesProcesados += details.incrementBatches || 0;
+  session.metrics.erroresConsecutivos = 0;
+  session.metrics.recaptchaInvalidoConsecutivo = 0;
+  session.metrics.ultimoErrorTipo = null;
+  session.metrics.ultimoErrorMensaje = null;
+
+  if (details.placa) {
+    session.metrics.ultimaPlaca = details.placa;
+  }
+}
+
+function markBrowserSessionError(session, error, details = {}) {
+  if (!session) {
+    return;
+  }
+
+  const errorType = classifyBrowserError(error);
+  session.lastUsedAtMs = Date.now();
+  session.metrics.erroresConsecutivos += 1;
+  session.metrics.ultimoErrorTipo = errorType;
+  session.metrics.ultimoErrorMensaje = error && error.message ? error.message : String(error);
+
+  if (details.placa) {
+    session.metrics.ultimaPlaca = details.placa;
+  }
+
+  if (errorType === 'recaptcha_invalid') {
+    session.metrics.recaptchaInvalidoConsecutivo += 1;
+  } else {
+    session.metrics.recaptchaInvalidoConsecutivo = 0;
+  }
+
+  createSessionLog(session.label, 'error', {
+    sessionId: session.id,
+    errorType,
+    placa: details.placa || null,
+    erroresConsecutivos: session.metrics.erroresConsecutivos,
+    recaptchaInvalidoConsecutivo: session.metrics.recaptchaInvalidoConsecutivo,
+    message: session.metrics.ultimoErrorMensaje
+  });
+}
+
+function shouldRecycleBrowserSession(session, policy = {}) {
+  if (!session) {
+    return { recycle: true, reasons: ['missing_session'] };
+  }
+
+  const {
+    force = false,
+    maxBatches = parseInt(process.env.BROWSER_MAX_BATCHES_PER_SESSION || '3', 10),
+    maxPlates = parseInt(process.env.BROWSER_MAX_PLATES_PER_SESSION || '15', 10),
+    maxAgeMs = parseInt(process.env.BROWSER_MAX_AGE_MS || '900000', 10),
+    maxConsecutiveErrors = parseInt(process.env.BROWSER_MAX_CONSECUTIVE_ERRORS || '2', 10),
+    maxConsecutiveRecaptchaErrors = parseInt(process.env.BROWSER_MAX_CONSECUTIVE_RECAPTCHA_ERRORS || '2', 10)
+  } = policy;
+
+  const reasons = [];
+  const ageMs = Date.now() - session.createdAtMs;
+
+  if (force) {
+    reasons.push('forced');
+  }
+  if (Number.isFinite(maxBatches) && maxBatches > 0 && session.metrics.lotesProcesados >= maxBatches) {
+    reasons.push(`max_batches:${session.metrics.lotesProcesados}/${maxBatches}`);
+  }
+  if (Number.isFinite(maxPlates) && maxPlates > 0 && session.metrics.placasProcesadas >= maxPlates) {
+    reasons.push(`max_plates:${session.metrics.placasProcesadas}/${maxPlates}`);
+  }
+  if (Number.isFinite(maxAgeMs) && maxAgeMs > 0 && ageMs >= maxAgeMs) {
+    reasons.push(`max_age_ms:${ageMs}/${maxAgeMs}`);
+  }
+  if (Number.isFinite(maxConsecutiveErrors) && maxConsecutiveErrors > 0 && session.metrics.erroresConsecutivos >= maxConsecutiveErrors) {
+    reasons.push(`consecutive_errors:${session.metrics.erroresConsecutivos}/${maxConsecutiveErrors}`);
+  }
+  if (Number.isFinite(maxConsecutiveRecaptchaErrors) && maxConsecutiveRecaptchaErrors > 0 && session.metrics.recaptchaInvalidoConsecutivo >= maxConsecutiveRecaptchaErrors) {
+    reasons.push(`consecutive_recaptcha:${session.metrics.recaptchaInvalidoConsecutivo}/${maxConsecutiveRecaptchaErrors}`);
+  }
+
+  return {
+    recycle: reasons.length > 0,
+    reasons,
+    ageMs
+  };
+}
+
+async function safeCloseBrowserSession(session = null, reason = 'normal_close') {
+  if (!session) {
+    return;
+  }
+
+  createSessionLog(session.label, 'closed', {
+    sessionId: session.id,
+    reason,
+    metrics: session.metrics,
+    sessionRoot: session.sessionRoot
+  });
+
+  await closeBrowserResources(session.page, session.browser, `${session.label}|${reason}`);
+
+  session.browser = null;
+  session.page = null;
+}
+
 async function cleanupAllBrowserResources() {
   const resources = Array.from(activeBrowserResources);
   await Promise.all(resources.map(resource => removeBrowserTempDir(resource)));
@@ -335,6 +519,11 @@ async function cleanupAllBrowserResources() {
 module.exports = {
   launchBrowser,
   preparePage,
+  createBrowserSession,
+  safeCloseBrowserSession,
+  markBrowserSessionSuccess,
+  markBrowserSessionError,
+  shouldRecycleBrowserSession,
   randomDelay,
   logCurrentPublicIP,
   closeBrowserResources,
